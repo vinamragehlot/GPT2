@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import torch
+import inspect
 import torch.nn as nn
 from torch.nn import functional as F
 from methods.Block import Block
@@ -70,6 +71,33 @@ class GPT(nn.Module):
             # cross entropy doesn't accept tensor, so we flatten it out
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return logits, loss  #at init, every token should have -ln(1/50257)=~11
+    
+    def configure_optimizers(self, weight_decay, learning_rate, device_type, master_process):
+        # instead of each kernal updating parameters during the Adam optimization
+        # this fuses all into 1 kernel and updates at once
+        # start with all of the candidate parameters (that require grad)
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]  # weight not decayed for 1-d tensors like bias
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        # Create AdamW optimizer and use the fused version if it is available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and "cuda" in device_type
+        if master_process:
+            print(f"using fused AdamW: {use_fused}")
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+        return optimizer
     
     @classmethod
     def from_pretrained(cls, model_type):
